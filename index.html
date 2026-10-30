@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="fi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lämpötila</title>
+<style>
+:root{--bg:#fff;--fg:#1f1f1c;--mut:#6b6a64;--grid:#e3e1d8;--ac:#d85a30;--card:#f5f4ef;--bd:#d3d1c7}
+@media(prefers-color-scheme:dark){:root{--bg:#1b1b19;--fg:#ecebe4;--mut:#a3a199;--grid:#33332f;--ac:#f0997b;--card:#262624;--bd:#44443f}}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,sans-serif;max-width:900px;margin:0 auto}
+h1{font-size:20px;font-weight:500;margin:0 0 12px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
+button,select{font:inherit;padding:8px 14px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--fg);cursor:pointer}
+button.p{background:var(--ac);border-color:var(--ac);color:#fff}
+#now{font-size:56px;font-weight:500;line-height:1.1}
+#st{color:var(--mut);font-size:14px}
+.stats{display:flex;gap:16px;color:var(--mut);font-size:14px;flex-wrap:wrap}
+.stats b{color:var(--fg);font-weight:500}
+canvas{width:100%;height:320px;display:block;background:var(--card);border-radius:12px;touch-action:none}
+#tip{height:22px;font-size:14px;color:var(--mut)}
+</style>
+</head>
+<body>
+<h1>Lämpötilaseuranta</h1>
+<div class="row">
+  <button class="p" id="btn">Yhdistä laitteeseen</button>
+  <span id="st">Ei yhteyttä</span>
+</div>
+<div id="now">-- °C</div>
+<div class="row stats">
+  <span>Min <b id="mn">--</b></span>
+  <span>Max <b id="mx">--</b></span>
+  <span>Keskiarvo <b id="av">--</b></span>
+  <span>Pisteitä <b id="n">0</b></span>
+</div>
+<div class="row">
+  <select id="rng">
+    <option value="600000">10 min</option>
+    <option value="3600000" selected>1 tunti</option>
+    <option value="21600000">6 tuntia</option>
+    <option value="86400000">24 tuntia</option>
+    <option value="604800000">7 päivää</option>
+    <option value="0">Kaikki</option>
+  </select>
+  <button id="csv">Lataa CSV</button>
+  <button id="clr">Tyhjennä historia</button>
+</div>
+<canvas id="c"></canvas>
+<div id="tip">&nbsp;</div>
+<script>
+const SERVICE='environmental_sensing',CHAR='temperature',KEY='lampotila_hist_v1';
+const STORE_EVERY=10000,MAXPTS=30000;
+let data=[];try{data=JSON.parse(localStorage.getItem(KEY)||'[]')}catch(e){}
+let range=3600000,device=null,lastStore=0,shown=[],geo=null;
+const $=id=>document.getElementById(id);
+const setStatus=t=>$('st').textContent=t;
+
+function save(){
+  if(data.length>MAXPTS)data=data.slice(data.length-MAXPTS);
+  try{localStorage.setItem(KEY,JSON.stringify(data))}catch(e){}
+}
+
+async function openGatt(){
+  setStatus('Yhdistetään…');
+  const s=await device.gatt.connect();
+  const svc=await s.getPrimaryService(SERVICE);
+  const ch=await svc.getCharacteristic(CHAR);
+  ch.addEventListener('characteristicvaluechanged',onVal);
+  await ch.startNotifications();
+  setStatus('Yhdistetty: '+(device.name||'laite'));
+  $('btn').textContent='Yhdistetty';
+}
+
+async function connect(){
+  if(!navigator.bluetooth){
+    setStatus('Selain ei tue Web Bluetoothia. Käytä Chromea tai Edgeä (iPhonessa Bluefy-sovellus).');
+    return;
+  }
+  try{
+    device=await navigator.bluetooth.requestDevice({
+      filters:[{services:[SERVICE]},{namePrefix:'XIAO'}],
+      optionalServices:[SERVICE]
+    });
+    device.addEventListener('gattserverdisconnected',onDisc);
+    await openGatt();
+  }catch(e){setStatus('Virhe: '+e.message)}
+}
+
+async function onDisc(){
+  $('btn').textContent='Yhdistä laitteeseen';
+  for(let i=1;i<=10&&device&&!device.gatt.connected;i++){
+    setStatus('Yhteys katkesi, yritetään uudelleen ('+i+'/10)…');
+    await new Promise(r=>setTimeout(r,3000));
+    try{await openGatt();return}catch(e){}
+  }
+  if(!device.gatt.connected)setStatus('Ei yhteyttä. Paina Yhdistä uudelleen.');
+}
+
+function onVal(e){
+  const t=e.target.value.getInt16(0,true)/100;
+  $('now').textContent=t.toFixed(2).replace('.',',')+' °C';
+  const now=Date.now();
+  if(now-lastStore>=STORE_EVERY){
+    lastStore=now;
+    data.push([now,t]);
+    save();
+  }
+  draw();
+}
+
+function fmt(v){return v.toFixed(1).replace('.',',')}
+function timeLabel(ts,withDate){
+  const d=new Date(ts);
+  const t=d.toLocaleTimeString('fi-FI',{hour:'2-digit',minute:'2-digit'});
+  return withDate?d.toLocaleDateString('fi-FI',{day:'numeric',month:'numeric'})+' '+t:t;
+}
+
+function draw(){
+  const c=$('c'),r=c.getBoundingClientRect(),dpr=window.devicePixelRatio||1;
+  c.width=Math.round(r.width*dpr);c.height=Math.round(r.height*dpr);
+  const g=c.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);
+  const W=r.width,H=r.height,L=44,R=12,T=12,B=26;
+  const css=getComputedStyle(document.documentElement);
+  const fg=css.getPropertyValue('--mut').trim(),grid=css.getPropertyValue('--grid').trim(),ac=css.getPropertyValue('--ac').trim();
+  const now=Date.now();
+  const t0=range>0?now-range:(data.length?data[0][0]:now-60000);
+  const t1=now;
+  const pts=data.filter(p=>p[0]>=t0);
+  shown=pts;
+  $('n').textContent=pts.length;
+  g.clearRect(0,0,W,H);
+  g.font='12px system-ui,sans-serif';
+  if(pts.length<1){
+    g.fillStyle=fg;g.textAlign='center';
+    g.fillText('Ei vielä dataa. Yhdistä laite.',W/2,H/2);
+    $('mn').textContent=$('mx').textContent=$('av').textContent='--';
+    return;
+  }
+  let mn=Infinity,mx=-Infinity,sum=0;
+  for(const p of pts){if(p[1]<mn)mn=p[1];if(p[1]>mx)mx=p[1];sum+=p[1]}
+  $('mn').textContent=fmt(mn)+' °C';$('mx').textContent=fmt(mx)+' °C';$('av').textContent=fmt(sum/pts.length)+' °C';
+  let lo=mn,hi=mx;
+  if(hi-lo<1){const m=(hi+lo)/2;lo=m-0.5;hi=m+0.5}
+  const pad=(hi-lo)*0.1;lo-=pad;hi+=pad;
+  const X=t=>L+(t-t0)/(t1-t0)*(W-L-R);
+  const Y=v=>T+(1-(v-lo)/(hi-lo))*(H-T-B);
+  geo={X,Y,L,R,W,t0,t1};
+  g.strokeStyle=grid;g.fillStyle=fg;g.lineWidth=1;
+  g.textAlign='right';g.textBaseline='middle';
+  for(let i=0;i<=4;i++){
+    const v=lo+(hi-lo)*i/4,y=Y(v);
+    g.beginPath();g.moveTo(L,y);g.lineTo(W-R,y);g.stroke();
+    g.fillText(fmt(v),L-6,y);
+  }
+  g.textAlign='center';g.textBaseline='top';
+  const withDate=(t1-t0)>86400000;
+  for(let i=0;i<=4;i++){
+    const t=t0+(t1-t0)*i/4,x=X(t);
+    g.beginPath();g.moveTo(x,T);g.lineTo(x,H-B);g.stroke();
+    g.fillText(timeLabel(t,withDate),Math.min(Math.max(x,L+18),W-R-18),H-B+6);
+  }
+  g.strokeStyle=ac;g.lineWidth=2;g.lineJoin='round';
+  g.beginPath();
+  let prev=null;
+  for(const p of pts){
+    const x=X(p[0]),y=Y(p[1]);
+    if(!prev||p[0]-prev[0]>120000)g.moveTo(x,y);else g.lineTo(x,y);
+    prev=p;
+  }
+  g.stroke();
+  if(pts.length===1){g.fillStyle=ac;g.beginPath();g.arc(X(pts[0][0]),Y(pts[0][1]),3,0,7);g.fill()}
+}
+
+$('c').addEventListener('pointermove',e=>{
+  if(!geo||!shown.length)return;
+  const r=$('c').getBoundingClientRect(),x=e.clientX-r.left;
+  const t=geo.t0+(x-geo.L)/(geo.W-geo.L-geo.R)*(geo.t1-geo.t0);
+  let best=shown[0],bd=Infinity;
+  for(const p of shown){const d=Math.abs(p[0]-t);if(d<bd){bd=d;best=p}}
+  $('tip').textContent=new Date(best[0]).toLocaleString('fi-FI')+'  –  '+best[1].toFixed(2).replace('.',',')+' °C';
+});
+
+$('btn').onclick=connect;
+$('rng').onchange=e=>{range=+e.target.value;draw()};
+$('clr').onclick=()=>{if(confirm('Tyhjennetäänkö koko historia?')){data=[];save();draw()}};
+$('csv').onclick=()=>{
+  let s='aika;lampotila_C\n';
+  for(const p of data)s+=new Date(p[0]).toISOString()+';'+p[1].toFixed(2).replace('.',',')+'\n';
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob(['\ufeff'+s],{type:'text/csv'}));
+  a.download='lampotila.csv';a.click();
+};
+window.addEventListener('resize',draw);
+setInterval(draw,5000);
+draw();
+</script>
+</body>
+</html>
